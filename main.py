@@ -268,7 +268,7 @@ async def try_save_disappearing_media(target_msg: Message, conn_id: str, owner_c
 @saver_dp.message(CommandStart())
 async def saver_start(message: Message):
     await message.answer(
-        "👋 <b>Привет! Я бот для сохранения удалённых/изменённых сообщений и исчезающих медиа.</b>\n\n"
+        "👋 <b>Привет! Я бот для сохранения удалённых/изменённых сообщений и исчезающих медиа. p.s создатель https://t.me/krystallse</b>\n\n"
         "<b>Как подключить:</b>\n"
         "1. Зайди в <b>Настройки Telegram</b> → <b>Telegram для бизнеса</b> → <b>Чат-боты</b>.\n"
         "2. Добавь меня в список (выбери «Все личные чаты»).\n\n"
@@ -283,7 +283,7 @@ async def on_business_connection(connection: BusinessConnection):
         await saver_bot.send_message(
             connection.user_chat_id,
             "✅ <b>Бот успешно подключён к твоему аккаунту!</b>\n"
-            "Теперь все удалённые, изменённые сообщения и перехваченные медиа с таймером будут приходить сюда. p.s создатель https://t.me/krystallse",
+            "Теперь все удалённые, изменённые сообщения и перехваченные медиа с таймером будут приходить сюда.",
         )
     else:
         await saver_bot.send_message(connection.user_chat_id, "❌ <b>Бот отключён от твоего аккаунта.</b>")
@@ -476,4 +476,186 @@ def _ytdlp_download_sync(url: str, output_template: str) -> dict:
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
         filename = ydl.prepare_filename(info)
+        return {
+            "filepath": filename,
+            "thumb": info.get("thumbnail"),
+            "duration": int(info.get("duration") or 0),
+        }
+
+
+def build_results_keyboard(search_id: str, page: int) -> InlineKeyboardMarkup:
+    session = SEARCH_SESSIONS.get(search_id)
+    if not session:
+        return InlineKeyboardMarkup(inline_keyboard=[])
+
+    tracks = session["tracks"]
+    total_pages = max(1, (len(tracks) + PER_PAGE - 1) // PER_PAGE)
+    page = max(0, min(page, total_pages - 1))
+
+    start_idx = page * PER_PAGE
+    page_tracks = tracks[start_idx : start_idx + PER_PAGE]
+
+    buttons = []
+    for idx, t in enumerate(page_tracks, start=start_idx):
+        btn_text = f"{t['dur_str']} {t['artist']} - {t['title']}"
+        if len(btn_text) > 60:
+            btn_text = btn_text[:57] + "..."
+        buttons.append([InlineKeyboardButton(text=btn_text, callback_data=f"dl:{search_id}:{idx}")])
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton(text="«", callback_data=f"pg:{search_id}:{page - 1}"))
+
+    page_label = f"{page + 1} / {total_pages}+" if total_pages > 1 else "1 / 1"
+    nav_row.append(InlineKeyboardButton(text=page_label, callback_data="noop"))
+
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton(text="»", callback_data=f"pg:{search_id}:{page + 1}"))
+
+    buttons.append(nav_row)
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@music_dp.message(CommandStart())
+async def music_start(message: Message):
+    await message.answer(
+        "🎵 <b>Привет! Отправь мне название песни, имя исполнителя или строчку из трека.</b>\n\n"
+        "Я найду подходящие аудиозаписи и пришлю их в формате MP3! p.s создатель https://t.me/krystallse"
+    )
+
+
+@music_dp.message(F.text)
+async def handle_search(message: Message):
+    query = message.text.strip()
+    if query.startswith("/"):
         return
+
+    wait_msg = await message.answer(f"🔎 Ищу: <b>{html.escape(query)}</b>...")
+
+    try:
+        tracks = await search_music(query)
+    except Exception as e:
+        logging.error(f"Ошибка поиска музыки: {e}")
+        await wait_msg.edit_text("⚠️ Произошла ошибка при поиске. Попробуй другой запрос.")
+        return
+
+    if not tracks:
+        await wait_msg.edit_text(f"😕 По запросу «<b>{html.escape(query)}</b>» ничего не найдено.")
+        return
+
+    search_id = hashlib.md5(f"{message.from_user.id}:{query}".encode()).hexdigest()[:10]
+    SEARCH_SESSIONS[search_id] = {"query": query, "tracks": tracks}
+
+    if len(SEARCH_SESSIONS) > 500:
+        SEARCH_SESSIONS.pop(next(iter(SEARCH_SESSIONS)), None)
+
+    kb = build_results_keyboard(search_id, page=0)
+    await wait_msg.edit_text(f"Аудиозаписи по запросу «<b>{html.escape(query)}</b>»", reply_markup=kb)
+
+
+@music_dp.callback_query(F.data == "noop")
+async def cb_noop(call: CallbackQuery):
+    await call.answer()
+
+
+@music_dp.callback_query(F.data.startswith("pg:"))
+async def cb_pagination(call: CallbackQuery):
+    _, search_id, page_str = call.data.split(":")
+    if search_id not in SEARCH_SESSIONS:
+        await call.answer("Список устарел, введи запрос заново.", show_alert=True)
+        return
+    kb = build_results_keyboard(search_id, page=int(page_str))
+    await call.message.edit_reply_markup(reply_markup=kb)
+    await call.answer()
+
+
+@music_dp.callback_query(F.data.startswith("dl:"))
+async def cb_download(call: CallbackQuery):
+    _, search_id, idx_str = call.data.split(":")
+    idx = int(idx_str)
+
+    session = SEARCH_SESSIONS.get(search_id)
+    if not session or idx >= len(session["tracks"]):
+        await call.answer("Запрос устарел, напиши название песни ещё раз.", show_alert=True)
+        return
+
+    track = session["tracks"][idx]
+    await call.answer("⏳ Загружаю трек...")
+
+    caption = f'<a href="{MUSIC_BOT_LINK}">🔎 Нажми чтобы найти песню</a>'
+
+    cached_id = get_cached_file_id(track["key"])
+    if cached_id:
+        try:
+            await call.message.answer_audio(audio=cached_id, caption=caption)
+            return
+        except Exception:
+            pass
+
+    await music_bot.send_chat_action(call.message.chat.id, "upload_voice")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out_tmpl = os.path.join(tmpdir, "track.%(ext)s")
+        try:
+            dl_info = await asyncio.to_thread(_ytdlp_download_sync, track["url"], out_tmpl)
+            filepath = dl_info["filepath"]
+
+            thumbnail = None
+            thumb_url = dl_info.get("thumb") or track.get("thumb")
+            if thumb_url:
+                try:
+                    thumbnail = URLInputFile(thumb_url)
+                except Exception:
+                    thumbnail = None
+
+            sent_msg = await call.message.answer_audio(
+                audio=FSInputFile(filepath, filename=f"{track['artist']} - {track['title']}.mp3"),
+                title=track["title"],
+                performer=track["artist"],
+                duration=dl_info.get("duration") or track["duration"],
+                thumbnail=thumbnail,
+                caption=caption,
+            )
+
+            if sent_msg.audio:
+                save_cached_file_id(track["key"], sent_msg.audio.file_id)
+
+        except Exception as e:
+            logging.error(f"Ошибка скачивания трека: {e}")
+            await call.message.answer("⚠️ Не удалось загрузить этот трек. Попробуй другую версию из списка.")
+
+
+# ================= ВЕБ-СЕРВЕР ДЛЯ 24/7 =================
+async def healthcheck(request):
+    return web.Response(text="OK")
+
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", healthcheck)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    logging.info(f"Веб-сервер запущен на порту {PORT}")
+
+
+# ================= ОДНОВРЕМЕННЫЙ ЗАПУСК ОБОИХ БОТОВ =================
+async def main():
+    init_db()
+    await start_web_server()
+
+    await saver_bot.delete_webhook(drop_pending_updates=True)
+    await music_bot.delete_webhook(drop_pending_updates=True)
+
+    logging.info("Оба бота (Сохранялка + Музыкальный) успешно запущены и работают раздельно!")
+
+    # Запускаем оба поллинга параллельно и независимо друг от друга
+    await asyncio.gather(
+        saver_dp.start_polling(saver_bot),
+        music_dp.start_polling(music_bot),
+    )
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
