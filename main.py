@@ -373,7 +373,7 @@ async def on_deleted_business_messages(event: BusinessMessagesDeleted):
 
 
 # =====================================================================
-# ЧАСТЬ 2: ЛОГИКА МУЗЫКАЛЬНОГО БОТА (music_dp / music_bot)
+# ЧАСТЬ 2: ЛОГИКА МУЗЫКАЛЬНОГО БОТА С ОБХОДОМ DRM (music_dp / music_bot)
 # =====================================================================
 def get_cached_file_id(track_key: str):
     with sqlite3.connect(DB_PATH) as conn:
@@ -414,7 +414,7 @@ async def resolve_lyrics_or_query(user_query: str) -> str:
     return user_query
 
 
-def _ytdlp_search_sync(query: str, limit: int = 27) -> list:
+def _ytdlp_search_sync(query: str, limit: int = 35) -> list:
     ydl_opts = {
         "format": "bestaudio/best",
         "quiet": True,
@@ -429,9 +429,12 @@ def _ytdlp_search_sync(query: str, limit: int = 27) -> list:
         for entry in entries:
             if not entry or not entry.get("url"):
                 continue
+            duration = int(entry.get("duration") or 0)
+            if duration == 30:  # Отсеиваем демо-превью
+                continue
+
             title = entry.get("title") or "Неизвестный трек"
             uploader = entry.get("uploader") or ""
-            duration = entry.get("duration") or 0
 
             if " - " in title:
                 parts = title.split(" - ", 1)
@@ -441,14 +444,14 @@ def _ytdlp_search_sync(query: str, limit: int = 27) -> list:
                 song_name = title.strip()
 
             track_url = entry.get("url")
-            track_key = hashlib.md5(track_url.encode()).hexdigest()[:12]
+            track_key = hashlib.md5(f"{artist.lower()}_{song_name.lower()}_{duration // 5}".encode()).hexdigest()[:12]
 
             tracks.append({
                 "key": track_key,
                 "url": track_url,
                 "artist": artist,
                 "title": song_name,
-                "duration": int(duration) if duration else 0,
+                "duration": duration,
                 "dur_str": format_duration(duration),
                 "thumb": entry.get("thumbnail"),
             })
@@ -456,18 +459,18 @@ def _ytdlp_search_sync(query: str, limit: int = 27) -> list:
 
 
 async def search_music(user_query: str) -> list:
-    tracks = await asyncio.to_thread(_ytdlp_search_sync, user_query, 27)
+    tracks = await asyncio.to_thread(_ytdlp_search_sync, user_query, 35)
     if len(tracks) < 3:
         resolved = await resolve_lyrics_or_query(user_query)
         if resolved.lower() != user_query.lower():
-            more_tracks = await asyncio.to_thread(_ytdlp_search_sync, resolved, 27)
+            more_tracks = await asyncio.to_thread(_ytdlp_search_sync, resolved, 35)
             tracks = more_tracks + tracks
     return tracks
 
 
-def _ytdlp_download_sync(url: str, output_template: str) -> dict:
+def _try_download_single(url: str, output_template: str) -> dict:
     ydl_opts = {
-        "format": "bestaudio[ext=mp3]/bestaudio[ext=m4a]/bestaudio/best",
+        "format": "http_mp3_128/bestaudio[ext=mp3]/bestaudio[ext=m4a]/bestaudio/best",
         "outtmpl": output_template,
         "quiet": True,
         "no_warnings": True,
@@ -475,12 +478,39 @@ def _ytdlp_download_sync(url: str, output_template: str) -> dict:
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
+        if "entries" in info:
+            info = info["entries"][0]
         filename = ydl.prepare_filename(info)
         return {
             "filepath": filename,
             "thumb": info.get("thumbnail"),
             "duration": int(info.get("duration") or 0),
         }
+
+
+def _smart_download_sync(track: dict, all_session_tracks: list, output_template: str) -> dict:
+    urls_to_try = [track["url"]]
+    target_dur = track["duration"]
+    for other in all_session_tracks:
+        if other["url"] != track["url"] and abs(other["duration"] - target_dur) <= 15:
+            urls_to_try.append(other["url"])
+
+    for candidate_url in urls_to_try[:5]:
+        try:
+            return _try_download_single(candidate_url, output_template)
+        except Exception:
+            continue
+
+    search_q = f"{track['artist']} {track['title']}"
+    alt_results = _ytdlp_search_sync(search_q, limit=15)
+    for alt in alt_results:
+        if alt["url"] not in urls_to_try:
+            try:
+                return _try_download_single(alt["url"], output_template)
+            except Exception:
+                continue
+
+    raise RuntimeError("Все потоки этого трека защищены DRM")
 
 
 def build_results_keyboard(search_id: str, page: int) -> InlineKeyboardMarkup:
@@ -597,7 +627,9 @@ async def cb_download(call: CallbackQuery):
     with tempfile.TemporaryDirectory() as tmpdir:
         out_tmpl = os.path.join(tmpdir, "track.%(ext)s")
         try:
-            dl_info = await asyncio.to_thread(_ytdlp_download_sync, track["url"], out_tmpl)
+            dl_info = await asyncio.to_thread(
+                _smart_download_sync, track, session["tracks"], out_tmpl
+            )
             filepath = dl_info["filepath"]
 
             thumbnail = None
@@ -622,7 +654,7 @@ async def cb_download(call: CallbackQuery):
 
         except Exception as e:
             logging.error(f"Ошибка скачивания трека: {e}")
-            await call.message.answer("⚠️ Не удалось загрузить этот трек. Попробуй другую версию из списка.")
+            await call.message.answer("⚠️ Этот трек защищен правообладателем. Попробуй выбрать другую версию из списка.")
 
 
 # ================= ВЕБ-СЕРВЕР ДЛЯ 24/7 =================
@@ -650,7 +682,6 @@ async def main():
 
     logging.info("Оба бота (Сохранялка + Музыкальный) успешно запущены и работают раздельно!")
 
-    # Запускаем оба поллинга параллельно и независимо друг от друга
     await asyncio.gather(
         saver_dp.start_polling(saver_bot),
         music_dp.start_polling(music_bot),
