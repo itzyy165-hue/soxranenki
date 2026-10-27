@@ -1,11 +1,16 @@
 import asyncio
+import hashlib
 import html
 import io
 import logging
 import os
 import sqlite3
+import tempfile
 import time
+import aiohttp
 from aiohttp import web
+import yt_dlp
+
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -14,26 +19,45 @@ from aiogram.types import (
     BufferedInputFile,
     BusinessConnection,
     BusinessMessagesDeleted,
+    CallbackQuery,
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
     Message,
+    URLInputFile,
 )
 
 # ================= НАСТРОЙКИ =================
-# Токен можно задать через переменные окружения на хостинге (BOT_TOKEN) или вписать прямо сюда:
-BOT_TOKEN = os.getenv("BOT_TOKEN", "9289471665:AAHXR4SyFFOmi7FOZIl_nM8AWUffPBEVbBI")
-DB_PATH = "bot_cache.db"
-PORT = int(os.getenv("PORT", 8080))  # Порт для Render / Koyeb
+# Токен первого бота (Сохранялка)
+SAVER_BOT_TOKEN = os.getenv("BOT_TOKEN", "9289471665:AAHXR4SyFFOmi7FOZIl_nM8AWUffPBEVbBI")
+
+# Токен второго бота (Музыкальный)
+MUSIC_BOT_TOKEN = os.getenv("MUSIC_BOT_TOKEN", "8760282415:AAG8D_lBkMmDKNnzo4RK6cHCMsnH-TsqGQc")
+
+# Заглушка ссылки под песней — подставь ссылку на своего музыкального бота:
+MUSIC_BOT_LINK = "https://t.me/MightyMusi3cBot"
+
+DB_PATH = "bots_data.db"
+PORT = int(os.getenv("PORT", 8080))
+PER_PAGE = 9
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp = Dispatcher()
+# Создаём два отдельных экземпляра ботов и два отдельных диспетчера
+saver_bot = Bot(token=SAVER_BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+saver_dp = Dispatcher()
+
+music_bot = Bot(token=MUSIC_BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+music_dp = Dispatcher()
+
+SEARCH_SESSIONS = {}
 
 
-# ================= БАЗА ДАННЫХ =================
+# ================= ОБЩАЯ БАЗА ДАННЫХ =================
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
-        # Таблица подключенных бизнес-аккаунтов (для работы на 3-5+ человек)
+        # Таблицы для Бота №1 (Сохранялка)
         c.execute("""
             CREATE TABLE IF NOT EXISTS connections (
                 connection_id TEXT PRIMARY KEY,
@@ -42,7 +66,6 @@ def init_db():
                 is_enabled INTEGER
             )
         """)
-        # Таблица кэша сообщений для отслеживания изменений и удалений
         c.execute("""
             CREATE TABLE IF NOT EXISTS messages (
                 connection_id TEXT,
@@ -58,18 +81,27 @@ def init_db():
                 PRIMARY KEY (connection_id, chat_id, message_id)
             )
         """)
-        # Таблица чтобы не дублировать сохранение одного и того же таймера
         c.execute("""
-            CREATE TABLE IF NOT EXISTS saved_Protected (
+            CREATE TABLE IF NOT EXISTS saved_protected (
                 connection_id TEXT,
                 chat_id INTEGER,
                 message_id INTEGER,
                 PRIMARY KEY (connection_id, chat_id, message_id)
             )
         """)
+        # Таблица для Бота №2 (Музыкальный кэш)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS track_cache (
+                track_key TEXT PRIMARY KEY,
+                file_id TEXT
+            )
+        """)
         conn.commit()
 
 
+# =====================================================================
+# ЧАСТЬ 1: ЛОГИКА БОТА-СОХРАНЯЛКИ (saver_dp / saver_bot)
+# =====================================================================
 def save_connection(conn_id: str, owner_chat_id: int, owner_user_id: int, is_enabled: bool):
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
@@ -81,15 +113,13 @@ def save_connection(conn_id: str, owner_chat_id: int, owner_user_id: int, is_ena
 
 def get_owner(conn_id: str):
     with sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute(
+        return conn.execute(
             "SELECT owner_chat_id, owner_user_id FROM connections WHERE connection_id = ? AND is_enabled = 1",
             (conn_id,),
         ).fetchone()
-        return row  # (owner_chat_id, owner_user_id) или None
 
 
 def extract_media(msg: Message):
-    """Извлекает тип медиа и file_id из сообщения, если они есть."""
     if msg.photo:
         return "photo", msg.photo[-1].file_id
     if msg.video:
@@ -133,7 +163,6 @@ def cache_message(msg: Message):
                 int(time.time()),
             ),
         )
-        # Автоочистка сообщений старше 7 дней, чтобы база не раздувалась
         conn.execute("DELETE FROM messages WHERE timestamp < ?", (int(time.time()) - 7 * 86400,))
         conn.commit()
 
@@ -151,15 +180,12 @@ def get_cached_message(conn_id: str, chat_id: int, message_id: int):
 def is_media_already_saved(conn_id: str, chat_id: int, message_id: int) -> bool:
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute(
-            "SELECT 1 FROM saved_Protected WHERE connection_id = ? AND chat_id = ? AND message_id = ?",
+            "SELECT 1 FROM saved_protected WHERE connection_id = ? AND chat_id = ? AND message_id = ?",
             (conn_id, chat_id, message_id),
         ).fetchone()
         if row:
             return True
-        conn.execute(
-            "INSERT INTO saved_Protected VALUES (?, ?, ?)",
-            (conn_id, chat_id, message_id),
-        )
+        conn.execute("INSERT INTO saved_protected VALUES (?, ?, ?)", (conn_id, chat_id, message_id))
         conn.commit()
         return False
 
@@ -172,60 +198,48 @@ def format_sender(name: str, username: str, user_id: int) -> str:
 
 
 async def send_cached_media(owner_chat_id: int, media_type: str, file_id: str, caption: str):
-    """Отправляет сохраненное медиа владельцу бота."""
     try:
         if media_type == "photo":
-            await bot.send_photo(owner_chat_id, file_id, caption=caption)
+            await saver_bot.send_photo(owner_chat_id, file_id, caption=caption)
         elif media_type == "video":
-            await bot.send_video(owner_chat_id, file_id, caption=caption)
+            await saver_bot.send_video(owner_chat_id, file_id, caption=caption)
         elif media_type == "voice":
-            await bot.send_voice(owner_chat_id, file_id, caption=caption)
+            await saver_bot.send_voice(owner_chat_id, file_id, caption=caption)
         elif media_type == "audio":
-            await bot.send_audio(owner_chat_id, file_id, caption=caption)
+            await saver_bot.send_audio(owner_chat_id, file_id, caption=caption)
         elif media_type == "document":
-            await bot.send_document(owner_chat_id, file_id, caption=caption)
+            await saver_bot.send_document(owner_chat_id, file_id, caption=caption)
         elif media_type == "animation":
-            await bot.send_animation(owner_chat_id, file_id, caption=caption)
+            await saver_bot.send_animation(owner_chat_id, file_id, caption=caption)
         elif media_type == "video_note":
-            await bot.send_video_note(owner_chat_id, file_id)
-            await bot.send_message(owner_chat_id, caption)
+            await saver_bot.send_video_note(owner_chat_id, file_id)
+            await saver_bot.send_message(owner_chat_id, caption)
         elif media_type == "sticker":
-            await bot.send_sticker(owner_chat_id, file_id)
-            await bot.send_message(owner_chat_id, caption)
+            await saver_bot.send_sticker(owner_chat_id, file_id)
+            await saver_bot.send_message(owner_chat_id, caption)
     except Exception as e:
         logging.error(f"Ошибка отправки медиа: {e}")
-        await bot.send_message(owner_chat_id, f"{caption}\n\n<i>⚠️ Не удалось прикрепить медиафайл.</i>")
+        await saver_bot.send_message(owner_chat_id, f"{caption}\n\n<i>⚠️ Не удалось прикрепить медиафайл.</i>")
 
 
-# ================= ПЕРЕХВАТ ИСЧЕЗАЮЩИХ МЕДИА =================
 async def try_save_disappearing_media(target_msg: Message, conn_id: str, owner_chat_id: int):
-    """
-    Скачивает фото/видео из target_msg (например, из reply_to_message) в оперативную память
-    и отправляет напрямую в чат с ботом.
-    """
     media_type, file_id = extract_media(target_msg)
     if media_type not in ("photo", "video", "voice", "video_note"):
         return False
 
-    # Проверяем, есть ли у сообщения флаг защищенного/исчезающего контента
-    # Либо если у него нет обычного текста и на него ответили
     has_protected = getattr(target_msg, "has_protected_content", False)
-
-    # Чтобы бот не сохранял вообще каждую обычную картинку, на которую ты ответила,
-    # проверяем: если это обычное фото, оно уже есть в нашей базе messages.
-    # А вот фото с таймером Telegram НЕ присылает в обычный поток, поэтому в кэше его НЕТ!
     in_cache = get_cached_message(conn_id, target_msg.chat.id, target_msg.message_id)
 
     if in_cache and not has_protected:
-        return False  # Это обычное не исчезающее сообщение, оно и так в базе
+        return False
 
     if is_media_already_saved(conn_id, target_msg.chat.id, target_msg.message_id):
         return False
 
     try:
-        file_info = await bot.get_file(file_id)
+        file_info = await saver_bot.get_file(file_id)
         file_buffer = io.BytesIO()
-        await bot.download_file(file_info.file_path, destination=file_buffer)
+        await saver_bot.download_file(file_info.file_path, destination=file_buffer)
         file_bytes = file_buffer.getvalue()
 
         sender_str = ""
@@ -237,27 +251,22 @@ async def try_save_disappearing_media(target_msg: Message, conn_id: str, owner_c
             caption += f"\n\n<blockquote>{html.escape(target_msg.caption)}</blockquote>"
 
         if media_type == "photo":
-            input_file = BufferedInputFile(file_bytes, filename="saved_photo.jpg")
-            await bot.send_photo(owner_chat_id, input_file, caption=caption)
+            await saver_bot.send_photo(owner_chat_id, BufferedInputFile(file_bytes, filename="photo.jpg"), caption=caption)
         elif media_type == "video":
-            input_file = BufferedInputFile(file_bytes, filename="saved_video.mp4")
-            await bot.send_video(owner_chat_id, input_file, caption=caption)
+            await saver_bot.send_video(owner_chat_id, BufferedInputFile(file_bytes, filename="video.mp4"), caption=caption)
         elif media_type == "voice":
-            input_file = BufferedInputFile(file_bytes, filename="saved_voice.ogg")
-            await bot.send_voice(owner_chat_id, input_file, caption=caption)
+            await saver_bot.send_voice(owner_chat_id, BufferedInputFile(file_bytes, filename="voice.ogg"), caption=caption)
         elif media_type == "video_note":
-            input_file = BufferedInputFile(file_bytes, filename="saved_circle.mp4")
-            await bot.send_video_note(owner_chat_id, input_file)
-            await bot.send_message(owner_chat_id, caption)
+            await saver_bot.send_video_note(owner_chat_id, BufferedInputFile(file_bytes, filename="circle.mp4"))
+            await saver_bot.send_message(owner_chat_id, caption)
         return True
     except Exception as e:
         logging.warning(f"Не удалось скачать исчезающее медиа: {e}")
         return False
 
 
-# ================= ХЭНДЛЕРЫ TELEGRAM =================
-@dp.message(CommandStart())
-async def cmd_start(message: Message):
+@saver_dp.message(CommandStart())
+async def saver_start(message: Message):
     await message.answer(
         "👋 <b>Привет! Я бот для сохранения удалённых/изменённых сообщений и исчезающих медиа.</b>\n\n"
         "<b>Как подключить:</b>\n"
@@ -267,50 +276,45 @@ async def cmd_start(message: Message):
     )
 
 
-@dp.business_connection()
+@saver_dp.business_connection()
 async def on_business_connection(connection: BusinessConnection):
-    save_connection(
-        conn_id=connection.id,
-        owner_chat_id=connection.user_chat_id,
-        owner_user_id=connection.user.id,
-        is_enabled=connection.is_enabled,
-    )
+    save_connection(connection.id, connection.user_chat_id, connection.user.id, connection.is_enabled)
     if connection.is_enabled:
-        await bot.send_message(
+        await saver_bot.send_message(
             connection.user_chat_id,
             "✅ <b>Бот успешно подключён к твоему аккаунту!</b>\n"
-            "Теперь все удалённые, изменённые сообщения и перехваченные медиа с таймером будут приходить сюда.",
+            "Теперь все удалённые, изменённые сообщения и перехваченные медиа с таймером будут приходить сюда. p.s создатель https://t.me/krystallse",
         )
     else:
-        await bot.send_message(
-            connection.user_chat_id,
-            "❌ <b>Бот был отключён от твоего аккаунта.</b>",
-        )
+        await saver_bot.send_message(connection.user_chat_id, "❌ <b>Бот отключён от твоего аккаунта.</b>")
 
 
-@dp.business_message()
+@saver_dp.business_message()
 async def on_business_message(message: Message):
     conn_id = message.business_connection_id
     owner = get_owner(conn_id)
     if not owner:
-        # Если бот был подключен до запуска базы, пробуем сохранить, когда пишет сам владелец
-        return
+        try:
+            conn_info = await saver_bot.get_business_connection(conn_id)
+            save_connection(conn_info.id, conn_info.user_chat_id, conn_info.user.id, conn_info.is_enabled)
+            owner = (conn_info.user_chat_id, conn_info.user.id)
+        except Exception as e:
+            logging.error(f"Не удалось восстановить подключение: {e}")
+            return
 
-    owner_chat_id, owner_user_id = owner
-
+    owner_chat_id, _ = owner
     cache_message(message)
 
     if message.reply_to_message:
         await try_save_disappearing_media(message.reply_to_message, conn_id, owner_chat_id)
 
 
-@dp.edited_business_message()
+@saver_dp.edited_business_message()
 async def on_edited_business_message(message: Message):
     conn_id = message.business_connection_id
     owner = get_owner(conn_id)
     if not owner:
         return
-
     owner_chat_id, owner_user_id = owner
 
     if message.from_user and message.from_user.id == owner_user_id:
@@ -319,7 +323,6 @@ async def on_edited_business_message(message: Message):
 
     old_msg = get_cached_message(conn_id, message.chat.id, message.message_id)
     new_text = message.text or message.caption or ""
-
     sender_title = format_sender(
         message.from_user.full_name if message.from_user else "Собеседник",
         message.from_user.username if message.from_user else "",
@@ -328,7 +331,6 @@ async def on_edited_business_message(message: Message):
 
     if old_msg:
         old_text = old_msg.get("text") or ""
-        # Если текст реально изменился
         if old_text != new_text:
             text_alert = (
                 f"✏️ {sender_title} изменил(а) сообщение\n\n"
@@ -337,35 +339,25 @@ async def on_edited_business_message(message: Message):
                 f"<b>New:</b>\n"
                 f"<blockquote>{html.escape(new_text) if new_text else '<i>[Без текста]</i>'}</blockquote>"
             )
-            await bot.send_message(owner_chat_id, text_alert)
+            await saver_bot.send_message(owner_chat_id, text_alert)
 
-    # Обновляем сообщение в кэше на актуальную версию
     cache_message(message)
 
 
-@dp.deleted_business_messages()
+@saver_dp.deleted_business_messages()
 async def on_deleted_business_messages(event: BusinessMessagesDeleted):
     conn_id = event.business_connection_id
     owner = get_owner(conn_id)
     if not owner:
         return
-
     owner_chat_id, owner_user_id = owner
 
     for msg_id in event.message_ids:
         cached = get_cached_message(conn_id, event.chat.id, msg_id)
-        if not cached:
+        if not cached or cached["sender_id"] == owner_user_id:
             continue
 
-        # Не присылаем уведомления, если сообщение удалил сам владелец (по желанию можно убрать эту проверку)
-        if cached["sender_id"] == owner_user_id:
-            continue
-
-        sender_title = format_sender(
-            cached["sender_name"],
-            cached["sender_username"],
-            cached["sender_id"],
-        )
+        sender_title = format_sender(cached["sender_name"], cached["sender_username"], cached["sender_id"])
         msg_text = cached["text"]
         media_type = cached["media_type"]
         file_id = cached["file_id"]
@@ -377,32 +369,111 @@ async def on_deleted_business_messages(event: BusinessMessagesDeleted):
         if media_type and file_id:
             await send_cached_media(owner_chat_id, media_type, file_id, header)
         else:
-            await bot.send_message(owner_chat_id, header)
+            await saver_bot.send_message(owner_chat_id, header)
 
 
-# ================= ВЕБ-СЕРВЕР ДЛЯ ХОСТИНГА 24/7 =================
-async def healthcheck(request):
-    return web.Response(text="Bot is alive and running 24/7!")
+# =====================================================================
+# ЧАСТЬ 2: ЛОГИКА МУЗЫКАЛЬНОГО БОТА (music_dp / music_bot)
+# =====================================================================
+def get_cached_file_id(track_key: str):
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute("SELECT file_id FROM track_cache WHERE track_key = ?", (track_key,)).fetchone()
+        return row[0] if row else None
 
 
-async def start_web_server():
-    app = web.Application()
-    app.router.add_get("/", healthcheck)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    logging.info(f"Веб-сервер для поддержки 24/7 запущен на порту {PORT}")
+def save_cached_file_id(track_key: str, file_id: str):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("INSERT OR REPLACE INTO track_cache VALUES (?, ?)", (track_key, file_id))
+        conn.commit()
 
 
-# ================= ЗАПУСК =================
-async def main():
-    init_db()
-    await start_web_server()
-    await bot.delete_webhook(drop_pending_updates=True)
-    logging.info("Бот запущен!")
-    await dp.start_polling(bot)
+def format_duration(seconds) -> str:
+    if not seconds:
+        return "0:00"
+    mins, secs = divmod(int(seconds), 60)
+    return f"{mins}:{secs:02d}"
 
 
-if __name__ == "__main__":
-    asyncio.run(main())
+async def resolve_lyrics_or_query(user_query: str) -> str:
+    try:
+        timeout = aiohttp.ClientTimeout(total=4)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            url = "https://itunes.apple.com/search"
+            params = {"term": user_query, "media": "music", "limit": 1}
+            async with session.get(url, params=params) as resp:
+                if resp.status == 200:
+                    data = await resp.json(content_type=None)
+                    results = data.get("results", [])
+                    if results:
+                        artist = results[0].get("artistName", "")
+                        track = results[0].get("trackName", "")
+                        if artist and track:
+                            return f"{artist} - {track}"
+    except Exception:
+        pass
+    return user_query
+
+
+def _ytdlp_search_sync(query: str, limit: int = 27) -> list:
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": True,
+        "skip_download": True,
+    }
+    tracks = []
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(f"scsearch{limit}:{query}", download=False)
+        entries = info.get("entries", []) if info else []
+        for entry in entries:
+            if not entry or not entry.get("url"):
+                continue
+            title = entry.get("title") or "Неизвестный трек"
+            uploader = entry.get("uploader") or ""
+            duration = entry.get("duration") or 0
+
+            if " - " in title:
+                parts = title.split(" - ", 1)
+                artist, song_name = parts[0].strip(), parts[1].strip()
+            else:
+                artist = uploader if uploader else "Неизвестен"
+                song_name = title.strip()
+
+            track_url = entry.get("url")
+            track_key = hashlib.md5(track_url.encode()).hexdigest()[:12]
+
+            tracks.append({
+                "key": track_key,
+                "url": track_url,
+                "artist": artist,
+                "title": song_name,
+                "duration": int(duration) if duration else 0,
+                "dur_str": format_duration(duration),
+                "thumb": entry.get("thumbnail"),
+            })
+    return tracks
+
+
+async def search_music(user_query: str) -> list:
+    tracks = await asyncio.to_thread(_ytdlp_search_sync, user_query, 27)
+    if len(tracks) < 3:
+        resolved = await resolve_lyrics_or_query(user_query)
+        if resolved.lower() != user_query.lower():
+            more_tracks = await asyncio.to_thread(_ytdlp_search_sync, resolved, 27)
+            tracks = more_tracks + tracks
+    return tracks
+
+
+def _ytdlp_download_sync(url: str, output_template: str) -> dict:
+    ydl_opts = {
+        "format": "bestaudio[ext=mp3]/bestaudio[ext=m4a]/bestaudio/best",
+        "outtmpl": output_template,
+        "quiet": True,
+        "no_warnings": True,
+        "max_filesize": 48 * 1024 * 1024,
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        filename = ydl.prepare_filename(info)
+        return
