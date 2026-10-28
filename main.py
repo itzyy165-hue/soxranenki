@@ -313,7 +313,29 @@ async def music_download(call: CallbackQuery):
 # =====================================================================
 # БОТ №3: СКАЧИВАТЕЛЬ ВИДЕО (Instagram, TikTok, YouTube, VK и др.)
 # =====================================================================
-def _download_video_sync(url: str, out_template: str):
+async def _download_tiktok_or_ytdlp(url: str, out_template: str):
+    """Универсальная загрузка: для TikTok используется API-обходчик, для остальных — yt-dlp"""
+    if "tiktok.com" in url:
+        try:
+            async with aiohttp.ClientSession() as session:
+                # Используем стабильный публичный API для скачивания TikTok без водяных знаков
+                api_url = f"https://tikwm.com/api/?url={url}"
+                async with session.get(api_url) as resp:
+                    data = await resp.json()
+                    if data.get("code") == 0:
+                        video_url = data["data"]["play"]
+                        title = data["data"].get("title", "TikTok видео")
+                        
+                        # Скачиваем сам видеофайл
+                        async with session.get(video_url) as vid_resp:
+                            video_bytes = await vid_resp.read()
+                            with open(out_template, "wb") as f:
+                                f.write(video_bytes)
+                            return out_template, title
+        except Exception as e:
+            logging.warning(f"TikTok API fallback error: {e}")
+
+    # Стандартный yt-dlp для Instagram, YouTube, VK и т.д.
     ydl_opts = {
         "format": "best[ext=mp4]/best",
         "outtmpl": out_template,
@@ -321,14 +343,16 @@ def _download_video_sync(url: str, out_template: str):
         "no_warnings": True,
         "max_filesize": 50 * 1024 * 1024,
     }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        filename = ydl.prepare_filename(info)
-        return filename, info.get("title", "Видео")
+    def run_ytdlp():
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filename = ydl.prepare_filename(info)
+            return filename, info.get("title", "Видео")
+
+    return await asyncio.to_thread(run_ytdlp)
 
 @video_dp.message(CommandStart())
 async def video_start(message: Message):
-    # Убрана подпись из /start, теперь приветствие чистое
     await message.answer(
         "📥 <b>Отправь мне ссылку</b> на видео из Instagram, TikTok, YouTube, VK и др. — скачаю видео за пару секунд."
     )
@@ -341,17 +365,15 @@ async def video_handler(message: Message):
     
     wait = await message.answer("⏳ Скачиваю видео, подожди пару секунд...")
     with tempfile.TemporaryDirectory() as tmp:
-        out_tpl = os.path.join(tmp, "video.%(ext)s")
+        out_tpl = os.path.join(tmp, "video.mp4")
         try:
-            filepath, title = await asyncio.to_thread(_download_video_sync, text, out_tpl)
-            # Подпись добавляется строго к готовому скачанному видео
+            filepath, title = await _download_tiktok_or_ytdlp(text, out_tpl)
             caption = f"🎬 <b>{html.escape(title[:100])}</b>\n\n<i>{VIDEO_BOT_SIGNATURE}</i>"
             await message.answer_video(video=FSInputFile(filepath), caption=caption)
             await wait.delete()
         except Exception as e:
             logging.error(f"Ошибка загрузки видео: {e}")
-            await wait.edit_text("⚠️ Не удалось скачать видео по этой ссылке. Убедись, что ссылка правильная")
-
+            await wait.edit_text("⚠️ Не удалось скачать видео по этой ссылке. Убедись, что ссылка правильная и профиль открытый.")
 
 # ================= ВЕБ-СЕРВЕР ДЛЯ 24/7 =================
 async def healthcheck(request):
