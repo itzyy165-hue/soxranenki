@@ -41,7 +41,6 @@ PER_PAGE = 9
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# Создаём три независимых экземпляра ботов и три диспетчера
 saver_bot = Bot(token=SAVER_BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 saver_dp = Dispatcher()
 
@@ -58,7 +57,6 @@ SEARCH_SESSIONS = {}
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
-        # Таблицы для Сохранялки
         c.execute("""
             CREATE TABLE IF NOT EXISTS connections (
                 connection_id TEXT PRIMARY KEY,
@@ -90,7 +88,6 @@ def init_db():
                 PRIMARY KEY (connection_id, chat_id, message_id)
             )
         """)
-        # Таблица кэша для Музыкального бота
         c.execute("""
             CREATE TABLE IF NOT EXISTS track_cache (
                 track_key TEXT PRIMARY KEY,
@@ -331,9 +328,9 @@ def _download_video_sync(url: str, out_template: str):
 
 @video_dp.message(CommandStart())
 async def video_start(message: Message):
+    # Убрана подпись из /start, теперь приветствие чистое
     await message.answer(
-        "📥 <b>Отправь мне ссылку</b> на видео из Instagram, TikTok, YouTube, VK и др.\n\n"
-        f"<i>{VIDEO_BOT_SIGNATURE}</i>"
+        "📥 <b>Отправь мне ссылку</b> на видео из Instagram, TikTok, YouTube, VK и др. — скачаю видео за пару секунд."
     )
 
 @video_dp.message(F.text)
@@ -347,6 +344,7 @@ async def video_handler(message: Message):
         out_tpl = os.path.join(tmp, "video.%(ext)s")
         try:
             filepath, title = await asyncio.to_thread(_download_video_sync, text, out_tpl)
+            # Подпись добавляется строго к готовому скачанному видео
             caption = f"🎬 <b>{html.escape(title[:100])}</b>\n\n<i>{VIDEO_BOT_SIGNATURE}</i>"
             await message.answer_video(video=FSInputFile(filepath), caption=caption)
             await wait.delete()
