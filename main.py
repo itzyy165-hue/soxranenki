@@ -266,7 +266,7 @@ def _download_track_sync(url, out):
 
 @music_dp.message(CommandStart())
 async def music_start(message: Message):
-    await message.answer("🎵 <b>Привет! Отправь название песни или строчку из трека.</b>\n\nЯ найду аудиозаписи в MP3! p.s создатель https://t.me/krystallse")
+    await message.answer("🎵 <b>Привет! Отправь название песни или строчку из трека.</b>\n\nЯ найду аудиозаписи в MP3! P.s создатель https://t.me/krystallse")
 
 @music_dp.message(F.text)
 async def music_search(message: Message):
@@ -308,7 +308,6 @@ async def music_download(call: CallbackQuery):
             if sent.audio: save_cached_track(track["key"], sent.audio.file_id)
         except:
             await call.message.answer("⚠️ Не удалось скачать этот трек, попробуй другой.")
-
 
 # =====================================================================
 # БОТ №3: СКАЧИВАТЕЛЬ ВИДЕО (Instagram, TikTok, YouTube, VK и др.)
@@ -373,7 +372,7 @@ async def video_handler(message: Message):
             await wait.delete()
         except Exception as e:
             logging.error(f"Ошибка загрузки видео: {e}")
-            await wait.edit_text("⚠️ Не удалось скачать видео по этой ссылке. Убедись, что ссылка правильная и профиль открытый.")
+            await wait.edit_text("⚠️ Не удалось скачать видео по этой ссылке. Убедись, что ссылка правильная")
 
 # ================= ВЕБ-СЕРВЕР ДЛЯ 24/7 =================
 async def healthcheck(request):
