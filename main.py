@@ -313,19 +313,18 @@ async def music_download(call: CallbackQuery):
 # БОТ №3: СКАЧИВАТЕЛЬ ВИДЕО (Instagram, TikTok, YouTube, VK и др.)
 # =====================================================================
 async def _download_tiktok_or_ytdlp(url: str, out_template: str):
-    """Универсальная загрузка: для TikTok используется API-обходчик, для остальных — yt-dlp"""
+    """Универсальная загрузка: для TikTok и YouTube используются надежные парсеры, для остальных — yt-dlp"""
+    
+    # 1. Обход для TikTok через публичный API
     if "tiktok.com" in url:
         try:
             async with aiohttp.ClientSession() as session:
-                # Используем стабильный публичный API для скачивания TikTok без водяных знаков
                 api_url = f"https://tikwm.com/api/?url={url}"
                 async with session.get(api_url) as resp:
                     data = await resp.json()
                     if data.get("code") == 0:
                         video_url = data["data"]["play"]
                         title = data["data"].get("title", "TikTok видео")
-                        
-                        # Скачиваем сам видеофайл
                         async with session.get(video_url) as vid_resp:
                             video_bytes = await vid_resp.read()
                             with open(out_template, "wb") as f:
@@ -334,7 +333,27 @@ async def _download_tiktok_or_ytdlp(url: str, out_template: str):
         except Exception as e:
             logging.warning(f"TikTok API fallback error: {e}")
 
-    # Стандартный yt-dlp для Instagram, YouTube, VK и т.д.
+    # 2. Обход для YouTube через стабильный публичный инстанс Invidious/Cobalt (обход капчи бота)
+    if "youtube.com" in url or "youtu.be" in url:
+        try:
+            async with aiohttp.ClientSession() as session:
+                # Используем открытый API-сервис для скачивания без блокировок
+                payload = {"url": url}
+                headers = {"Accept": "application/json", "Content-Type": "application/json"}
+                async with session.post("https://co.wuk.sh/api/json", json=payload, headers=headers) as resp:
+                    res_data = await resp.json()
+                    if res_data.get("status") == "stream" or "url" in res_data:
+                        download_url = res_data.get("url")
+                        title = res_data.get("filename", "YouTube видео")
+                        async with session.get(download_url) as vid_resp:
+                            video_bytes = await vid_resp.read()
+                            with open(out_template, "wb") as f:
+                                f.write(video_bytes)
+                            return out_template, title
+        except Exception as e:
+            logging.warning(f"YouTube API fallback error: {e}")
+
+    # 3. Стандартный yt-dlp для Instagram, VK и т.д.
     ydl_opts = {
         "format": "best[ext=mp4]/best",
         "outtmpl": out_template,
@@ -372,7 +391,7 @@ async def video_handler(message: Message):
             await wait.delete()
         except Exception as e:
             logging.error(f"Ошибка загрузки видео: {e}")
-            await wait.edit_text("⚠️ Не удалось скачать видео по этой ссылке. Убедись, что ссылка правильная")
+            await wait.edit_text("⚠️ Не удалось скачать видео по этой ссылке. Убедись, что ссылка правильная и профиль открытый.")
 
 # ================= ВЕБ-СЕРВЕР ДЛЯ 24/7 =================
 async def healthcheck(request):
